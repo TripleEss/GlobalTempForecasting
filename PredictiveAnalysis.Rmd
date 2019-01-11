@@ -1,0 +1,220 @@
+Theo Carr
+DS4100 Project
+Linear Regression models
+
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Packages
+```{r}
+library(XML)
+library(ggplot2)
+library(magrittr)
+library(yaml)
+library(lubridate)
+library(RCurl)
+library(readxl)
+library(BSDA)
+library(forecast)
+library(caret)
+library(RSQLite)
+library(psych)
+library(RSQLite)
+```
+
+
+Connecting to database
+```{r}
+db <- dbConnect(SQLite(), "/Users/theocarr/ClimateChange.db") # Connecting to SQLite
+summary(db) # checking the connection
+```
+
+Querying data
+
+Global Temperature predictors
+```{r}
+query <- "SELECT * FROM GlobalTempPredictors;"
+data <- dbSendQuery(db, query) # sending the query
+global.temp.predictors <- dbFetch(data) # fetching the output
+```
+
+Location Data
+```{r}
+query <- "SELECT * FROM GeoData;" # SQL command
+data <- dbSendQuery(db, query) # sending the query
+geoData <- dbFetch(data) # fetching the output
+```
+
+
+
+Disconnecting from data base
+```{r}
+dbDisconnect(db)
+```
+
+
+--------------------------------------- Global Temperature Prediction ------------------------------
+Training and validation data subsets. Training data will be equal to 70% of overall data set
+```{r}
+sample.indices <- sample(nrow(global.temp.predictors), size = 0.7*nrow(global.temp.predictors))
+training.data <- global.temp.predictors[sample.indices,]
+validation.data <- global.temp.predictors[-sample.indices,]
+```
+
+
+Stage 1 model: predict global temperature based on Atmosphere data
+```{r}
+stage1 <- lm(data = training.data, GlobalAvg ~ CO2spl+ CH4_GrRt + N2O_GrRt)
+summary(stage1)
+```
+Removing CH4_GrRt from the model:
+```{r}
+stage1 <- lm(data = training.data, GlobalAvg ~ CO2spl + N2O_GrRt)
+summary(stage1)
+```
+
+Removing N2O_GrRt from the model:
+```{r}
+stage1 <- lm(data = training.data, GlobalAvg ~ CO2spl)
+summary(stage1)
+```
+
+Evaluating the model:
+```{r}
+preds <- predict(stage1, validation.data) # model's predictions
+actuals <- validation.data$GlobalAvg # actuals values
+
+MSE <- mean((preds-actuals)^2); MSE # calculating mean squared error
+MAD <- mean(abs(preds-actuals)); MAD # calculating mean absolute deviation
+plot(preds-actuals) # Plotting residuals to look for bias
+abline(h = 0) # representing residual of 0, for reference
+```
+The model does not appear to display a noticeable positive or negative bias, and this neutrality is consistent over time (i.e. the model doesn't more or less biased over time). It is important to note the small size of the validation subset (38 rows). While the model appears to be fairly effective, a larger sample size would help to confirm our findings.
+
+
+
+Prediction interval: Given that the CO2 concentration is 400 ppm, what is the expected average global temperature?
+```{r}
+CO2spl <- 400
+df <- data.frame(CO2spl)
+stage1.pred <- predict(stage1, df, interval = "predict"); stage1.pred
+```
+The expected average global temperature is about 15.5ºC, with a 95% confidence interval of [15.0ºC, 16.0ºC].
+
+
+
+
+-------------------------------- STAGE 2 ---------------------------------------
+Training/Validation data subsets
+```{r}
+sample.indices <- sample(nrow(geoData), size = 0.7*nrow(geoData))
+training.data <- geoData[sample.indices,]
+validation.data <- geoData[-sample.indices,]
+```
+
+
+Predicting the difference from the global temperature average based on geographic location
+```{r}
+stage2 <- lm(data = training.data, tempDiffs ~ EqDist + PmDist) # creating a linear model
+summary(stage2)
+```
+
+Based on the model summary, longitude is not a statistically significant predictor of temperature, which we expect. Therefore, we now remove this variable from our model.
+```{r}
+stage2 <- lm(data = training.data, tempDiffs ~ EqDist) # creating a linear model
+summary(stage2)
+```
+
+Plotting best fit line for model
+```{r}
+plot(geoData$EqDist, geoData$tempDiffs)
+abline(stage2)
+```
+
+Model Evaluation (Stage 2)
+```{r}
+preds <- predict(stage2, validation.data) # model's predictions
+actuals <- validation.data$tempDiffs # actuals values
+
+MSE <- mean((preds-actuals)^2); MSE # calculating mean squared error
+MAD <- mean(abs(preds-actuals)); MAD # calculating mean absolute deviation
+plot(preds-actuals) # Plotting residuals to look for bias
+abline(h = 0) # representing residual of 0, for reference
+```
+The Stage 2 model has an MSE of about 11 and a MAD of about 2.5ºC. Based on graphing residuals, the model is more likely to underestimate the temperature difference. However, when the model overestimates, the errors are likely to be much greater. The bias may be due to the underlying non-linearity of the relationship between latitude and temperature. There appears to be a plateau in temperature close to the equator; this deficiency could potentially be addressed by clustering (i.e. creating a separate model for those locations close to the equator.)
+
+
+K-Means clustering of geography and temperature. 
+First, normalizing the data:
+```{r}
+geoData.normal <- data.frame(apply(geoData, 2, zScore))
+```
+
+We'll cluster solely based on temperature difference from global average, and visualize the results by plotting by location.
+```{r}
+n <- 3 # number of clusters to create
+set.seed(20) # setting seed to ensure reproducibility
+geoCluster <- kmeans(geoData[, c("tempDiffs")], n, nstart = 20) # creating 3 clusters
+# The clusters are based on temperature difference from the global average
+
+geoCluster$cluster <- as.factor(geoCluster$cluster) # Factoring cluster results (one of three)
+
+# Now, plotting Temperature distance by location
+ggplot(geoData, aes(PmDist, EqDist, color = geoCluster$cluster)) + geom_point() +
+    labs(x = "Longitude", y = "Latitude", title = "Temperature Difference from Average, by Location")
+
+# Visualizing relationship between latitude and cluster
+ggplot(geoData, aes(EqDist, tempDiffs, color = geoCluster$cluster)) + geom_point()
+```
+From the resulting graph, we can see that latitude has a clear effect on the temperature of a location. Longtitude also has a visible effect when taken with latitude. This makes sense - for atmospheric reasons (such as wind and ocean currents), certain regions of the globe have temperatures that are higher or lower than expected based solely on their latitude.
+
+Next, we'll clustering based on temperature difference AND geographic location.
+```{r}
+n <- 5 # number of clusters to create
+set.seed(20) # setting seed to ensure reproducibility
+gclust <- kmeans(geoData.normal[, c("tempDiffs", "EqDist", "PmDist")], n, nstart = 20) # creating n clusters
+
+gclust$cluster <- as.factor(gclust$cluster) # Factoring cluster results (one of three)
+
+# Now, plotting Temperature distance by location
+ggplot(geoData, aes(PmDist, EqDist, color = gclust$cluster)) + geom_point() +
+    labs(x = "Longitude", y = "Latitude", title = "Clustering based on temperature and location")
+```
+Here we can see that the clusters seem to follow the outline of traditionally recognized regions, such as America, Europe, East Asia, and India. Note the presence of "outlier" dots: a city on the northern tip of America is clustered with Europe, as is a city on the northern tip of India. Our current model for predicting local temperature only takes into account latitude, but this exercise in clustering demonstrates that it would be possible to improve our model by taking a more nuanced approach to geography. Two cities on opposite sides of the globe may have the same latitude, but factors such as wind and ocean currents and topography (elevation, mountain ranges, lakes, etc.) may differ widely between the two cities. Cities that have a similar latitude AND longitude are more likely to share these outside factors, even though their latitudes may differ more than the two cities on opposite sides of the globe.
+
+
+
+
+
+
+Prediction (Stage 2): Stage 1 model predicted that global average temperature would be 15.77ºC, with a 95% confidence interval of [15.78ºC, 16.32ºC], given CO2 concentration of 400 ppm and N2O growth rate of 0.5 ppb/year. In Stage 2, we'll predict the temperature at a given location based on this global average temperature. 
+Location: - Latitude  = 45ºN
+          - Longitude = 25ºE
+```{r}
+EqDist <- 45 # input data (the latitude)
+df <- data.frame(EqDist) # wrapping inside data frame
+stage2.pred <- predict(stage2, df, interval = "predict"); stage2.pred # prediction interval
+```
+
+Combining the two predictive models to predict the temperature at a given location, given concentration of certain atmospheric pollutants.
+```{r}
+total.pred <- stage1.pred + stage2.pred; total.pred
+stage1.pred
+stage2.pred
+```
+The expected average annual temperature for this location is 10.5ºC, with a 95% prediction interval of [3.8ºC, 17.3ºC]. Note that this interval is fairly wide, and the vast majority of the uncertainty comes from Stage 2 of our model (trying to predict temperature based on geographic location). To improve our model, it might be helpful to further investigate geographical clusters. The current model oversimplifies the relationship between location and temperature, only taking into account latitude as a predictor for temperature. To increase the effectiveness of the model, we could analyze specific regions of the globe, which may be effected by unique wind patterns, ocean currents, elevation, or other topographical features.
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,463 @@
+Theo Carr
+DS4100 Project
+Data cleaning and preparation
+
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Packages
+```{r}
+library(XML)
+library(ggplot2)
+library(magrittr)
+library(yaml)
+library(lubridate)
+library(RCurl)
+library(readxl)
+library(BSDA)
+library(forecast)
+library(caret)
+library(RSQLite)
+library(psych)
+```
+
+----------------------------------- IMPORTING DATA ------------------------------------
+
+Importing global temperature (by city) data set. This data set was found on Kaggle: https://www.kaggle.com/berkeleyearth/climate-change-earth-surface-temperature-data
+```{r}
+temps.by.city <- read.csv("GlobalLandTemperaturesByCity.csv")
+names(temps.by.city) <- c("Date", "AverageTemperature",
+                                "AverageTemperatureUncertainty", "City", 
+                                "Country", "Latitude", "Longitude")
+```
+
+
+Importing atmospheric data from the web. Some background information about the data:
+Spline fits to the Law Dome firn and ice core records and the Cape Grim record. 
+October 2008.  The spline fits follow Enting (1987) and attenuate variations with 
+periods of less than 20 years by 50%.  See Etheridge et al., JGR, 1996; 
+Etheridge et al., JGR, 1998; MacFarling Meure et al., GRL, 2006; 
+contact david.etheridge@csiro.au 
+
+Column 1: Year AD 
+Column 2: CH4 Spline (ppb) 
+Column 3: Growth Rate (ppb/yr) 
+Column 4: NOAA04 scale 
+Column 5: Year AD 
+Column 6: CO2 Spline (ppm) 
+Column 7: Growth Rate (ppm/yr) 
+Column 8: Year AD 
+Column 9: N2O Spline (ppb) 
+Column 10: Growth Rate (ppm/yr)
+
+```{r}
+url <- "ftp://ftp.ncdc.noaa.gov/pub/data/paleo/icecore/antarctica/law/law2006.txt"
+gas.data <- read.table(url, skip = 182, header = TRUE, nrows = 2004)
+gas.data <- gas.data[c(-5, -8)] # removing duplicate columns
+names(gas.data) <- c("YearAD", "CH4spl", "CH4_GrRt", "NOAA04", "CO2spl", "CO2_GrRt", "N2Ospl", "N2O_GrRt")
+```
+
+
+Importing human population data from UN report found at https://www.un.org/esa/population/publications/sixbillion/sixbilpart1.pdf. Data scraped from page 5 of the PDF report.
+
+"Tabula" is open-source application I used to scrape data from PDF (http://tabula.technology/). Tabula application scrapes the PDF and exports data in .csv file format. I will import the .csv file into R after saving to my working directory.
+```{r}
+human.pop <- read.csv("tabula-sixbilpart1.csv", header = TRUE, skip = 1)
+names(human.pop) <- c("Year", "PopulationInBillions")
+```
+
+First, functions to help determine outliers in the data sets.
+Functions to determine Z-Score (# of standard deviations from mean)
+```{r}
+# Creating a helper function to perform z-score standardization on an element of a vector
+zScore_helper <- function(x, v) {
+    # Rescale an element "x" in vector "v" based on number of standard deviations from the mean
+    # Args: x is an element of a numeric vector
+    #       v is a numeric vector
+    # Returns: a vector containing unbounded numeric values, of the same length as "v"       
+    return((x - mean(v)) / sd(v)) # z-score standardization
+}
+
+# Wrapper function for zScore: takes in a vector and standardizes it
+zScore <- function(vector) {
+    # Rescale all elements of a numeric vector based on their z-score
+    # Args: vector is a numeric vector
+    # Returns: numeric vector containing unbounded numeric values, of the same length as "v"
+    if (any(is.na(vector))) { # if there are any NAs in the vector
+        vector <- vector[-which(is.na(vector))] # remove all NAs
+    }
+    return(sapply(vector, zScore_helper, v = vector)) # determine z-score of each element in vector
+}
+```
+
+
+Data exploration and visualization:
+
+--------------------------- ATMOSPHERIC GAS CONCENTRATIONS / HUMAN POPULATION ----------------------------------
+Atmospheric Gas concentrations over time:
+```{r}
+recent.gas.data <- subset(gas.data, YearAD > 1750)
+ggplot(gas.data, aes(YearAD)) + 
+  geom_line(aes(y = CH4spl, color = "CH4")) +
+  geom_line(aes(y = CO2spl, color = "CO2")) +
+    geom_line(aes(y = N2Ospl, color = "N2O")) +
+    labs(x = "Year", y = "Concentration (PPM)", title = "Atmospheric Gas Concentrations since 0 AD")
+ggplot(gas.data, aes(YearAD)) + 
+  geom_line(aes(y = CO2spl, color = "CO2")) +
+    geom_line(aes(y = N2Ospl, color = "N2O")) +
+    labs(x = "Year", y = "Concentration (PPM)", title = "Atmospheric Gas Concentrations since 0 AD")
+ggplot(recent.gas.data, aes(YearAD)) + 
+  geom_line(aes(y = CH4spl, color = "CH4")) +
+  geom_line(aes(y = CO2spl, color = "CO2")) +
+    geom_line(aes(y = N2Ospl, color = "N2O")) +
+    labs(x = "Year", y = "Concentration (PPM)", title = "Atmospheric Gas Concentrations since 1750")
+ggplot(recent.gas.data, aes(YearAD)) + 
+  geom_line(aes(y = CO2spl, color = "CO2")) +
+    geom_line(aes(y = N2Ospl, color = "N2O")) +
+    labs(x = "Year", y = "Concentration (PPM)", title = "Atmospheric Gas Concentrations since 1750")
+```
+We note that there is a drastic increase in the levels of each gas in teh last ~250 years. Levels of CH4 have increased more rapidly than CO2 and N2O.
+
+
+Human Population over time
+```{r}
+ggplot(human.pop, aes(Year)) + 
+  geom_line(aes(y = PopulationInBillions, color = "Population in Billions")) +
+    labs(x = "Year", y = "Human Population (billions)", title = "Human Population since 0 AD")
+```
+Human population has also skyrocketed in recent years. The graph closely resembles the atmospheric gas concentrations plots from above.
+
+Histograms: outlier detection and normality:
+```{r}
+hist(gas.data$CH4spl)
+hist(gas.data$CO2spl)
+hist(gas.data$N2Ospl)
+hist(gas.data$CH4_GrRt)
+hist(gas.data$CO2_GrRt)
+hist(gas.data$N2O_GrRt)
+hist(human.pop$PopulationInBillions)
+```
+Based on the histograms above, there are likely outliers for each of the variables above (most of the graphs skew towards the left side). However, drawing from domain knowledge, many of the recent spike in atmospheric concentrations of gases such as CO2 and N2O can be attributed to human activity. Therefore, the recent (last ~250 years) exponential growth in human population could be a cause of the apparently exponential rise in atmospheric gas concentration. Because the purpose of this project is in part to quantify the effects of these increases, I will try to use a log transform to better normalize the data.
+
+Histograms of log transforms:
+```{r}
+hist(log(gas.data$CH4spl))
+hist(log(gas.data$CO2spl))
+hist(log(gas.data$N2Ospl))
+hist(log(gas.data$CH4_GrRt))
+hist(log(gas.data$CO2_GrRt))
+hist(log(gas.data$N2O_GrRt))
+hist(log(human.pop$PopulationInBillions))
+```
+The histograms with log transform do not show a marked increase from those without the transform. While the data does not appear to perfectly follow a normal distribution, I am hesistant to disregard the exceptionally high concentrations in recent years as outliers. There is a clear upward trend over time, and I think it is more practical to view these high readings as the result of human activity in recent years. 
+
+While I do not plan on removing outliers because of this reasoning, we will identify all instances that fall farther than 3 standard deviations from the mean (theoretical "outliers").
+
+
+Determining how many elements from each feature are theoretical outliers
+```{r}
+outlier.years <- c(which(abs(zScore(gas.data$CH4spl)) > 3),
+                   which(abs(zScore(gas.data$CH4_GrRt)) > 3),
+                   which(abs(zScore(gas.data$N2Ospl)) > 3),
+                   which(abs(zScore(gas.data$NOAA04)) > 3),
+                   which(abs(zScore(gas.data$N2O_GrRt)) > 3),
+                   which(abs(zScore(gas.data$CO2spl)) > 3),
+                   which(abs(zScore(gas.data$CO2_GrRt)) > 3))
+outlier.years <- unique(outlier.years) # union of sets (all years in which an outlier occurs)
+outlier.years <- outlier.years[order(outlier.years)]; outlier.years # ordering chronologically
+```
+
+Note that all theoretical outliers occur in in the past 200 years, and the majority in the last 100 years (all years 1951 to the present are theoretical outliers). It doesn't make sense to remove these values, as we are especially interested in this recent spike and the implications for the near future.
+
+
+-------------------------------- AVERAGE ANNUAL TEMPERATURES -----------------------------------
+
+Currently, we have monthly temperatures for each city. Some exploration reveals lots of seasonal volatility:
+```{r}
+london.temps <- subset(temps.by.city, City == "London")
+delhi.temps <- subset(temps.by.city, City == "Delhi")
+boston.temps <- subset(temps.by.city, City == "Boston")
+
+plot(london.temps$AverageTemperature,
+     ylab = "Temperature (ºC)",
+     main = "London Monthly Temperatures over time")
+plot(delhi.temps$AverageTemperature,
+     ylab = "Temperature (ºC)",
+     main = "Delhi Monthly Temperatures over time")
+plot(boston.temps$AverageTemperature,
+     ylab = "Temperature (ºC)",
+     main = "Boston Monthly Temperatures over time")
+```
+
+
+To simplify later analysis and remove seasonal cycles shown above, we will find the average annual temperature for each city. Note that by taking this step, we will lose information (for example, about seasonal extremes in temperature that might increase over time). To narrow the scope of analysis, this project will focus on the average annual temperature.
+```{r}
+start <- 1750 # First year to investigate
+end <- 2004 # Most recent year to investigate
+
+ # Function to get the average annual temperature of a city for one year
+getAnnualTemp <- function(df, year) {
+    # Function returns the average temperature for a data frame containing monthly temperatures
+    # Args: - "df" represents data frame of monthly temperatures. We will pass in a df containing
+    #           monthly temperatures for one city.
+    #       - "year" represents the year for the average temperature
+    # Returns: - average temperature for the given year
+    s <- subset(df, grepl(year, df[,1])) # getting subset of data that corresponds to given year
+    return(mean(s[,2]))
+}
+
+allAnnualTemp <- function(city) {
+    # Get the average annual temperatures of a city. A wrapper to apply "getAnnualTemp" function.
+    # Args: "city" is a string; one of 3500+ contained in the original data set
+    # Returns: vector representing annual temperatures for the given city 
+    selection <- subset(temps.by.city, City == city) # representing subset of data specific to city
+    years <- seq(from = start, to = end) # years for which we will obtain avg temperature
+    data <- sapply(years, getAnnualTemp, df = selection) # getting average temp for each year
+    return(data)
+}
+
+# Creating a dataframe with the average annual temperature for each major city in the data frame
+temps <- data.frame(seq(from = start, to = end), sapply(levels(temps.by.city$City), allAnnualTemp))
+names(temps)[1] <- "Year"
+```
+
+Plotting annual, rather than monthly temperatures
+```{r}
+d <- temps$Delhi
+plot(d, ylab = "Temperature (ºC)", main = "Average Annual Temperature in Delhi")
+```
+Notice the volatility is much reduced, and there is a much clearer trend to the data.
+
+
+Dealing with missing values in annual temperatures.
+```{r}
+countNA <- function(v) {
+    # Function to calculate the percentage of NAs in a vector.
+    # Args  - v represents a vector of z-scores
+    #       - threshold represents the cut-off: we'll consider any z-score that has 
+    #       an absolute value greater than the threshold to be an outlier
+    # Returns - percentage from 0 to 100 indicating proportion of outliers in the vector
+    return(100 * length(which(is.na(v))) / length(v)) # determine percentage of elements which are NA
+}
+
+na.count <- apply(temps, 2, countNA) # calculating the percentage of NAs for each feature
+
+n <- 30 # threshold percentage for NAs
+temps2 <- temps[which(na.count < n)] # Keep columns that have fewer than 30% of data missing
+```
+This "cutoff" of thirty percent is fairly arbitrary. While some cities have data points from as early as the mid 1700s, most cities do not, and therefore have a signficant number of NAs. There was a choice: look at a smaller pool of cities over a long time period, or look at a larger pool of cities over a shorter time period. I sought to find a balance between the two extremes, by eliminating all cities with more than 30% of values missing. This had the effect of cutting down the pool of cities from ~3500 to ~1500.
+
+
+Determining average global temperature over the same time period.
+```{r}
+# Investigating global average
+global.avg2 <- rowMeans(temps2[,2:ncol(temps2)]) # Calculate global average temperature
+# 1st column represents year, so we don't include when finding row's mean
+
+temps2 <- cbind(temps2, global.avg2) # add new feature to data frame
+index <- which(is.na(temps2$global.avg2)) # determine which rows have NA values
+test2 <- temps2[-index,] # Select non-NA values for new data frame
+```
+
+Adding human population and atmospheric information to our data frame
+```{r}
+start <- 1750 # First year
+end <- 2004 # Last year
+Year <- seq(from = start, to = end) # create x values for approximation
+recent.humans <- human.pop[5:20,] # human population values from 1750 to 2010
+inter <- approx(recent.humans$Year, recent.humans$PopulationInBillions, Year) # interpolating population 
+# values for specified years
+HumanPopulation <- inter$y # Taking just the dependent variable
+recent.gas <- gas.data[start:end,-1] # atmosphere values from 1750 to present
+# We exclude the redundant date column
+
+df <- data.frame(Year, recent.gas, HumanPopulation, global.avg2) # Creating data frame 
+df <- df[-which(is.na(df$global.avg2)),] # Removing instances where global average is NA
+```
+
+
+Correlation analysis of feature variables for average global temperature.
+```{r}
+cor(df[,-1])
+```
+We are most interested in variables that are correlated with global.avg2 (the global average temperature). The predictor with the highest correlation is CO2spl, followed closely by HumanPopulation, N2Ospl, NOAA04, and CH4spl. All predictor variables have a correlation > 0.7 with global average, except for the growth rates of CH4, N2O, and CO2.
+
+Investigating collinearity of predictor variables.
+```{r}
+cor(df[,-c(1, 3, 6, 8, 10)])
+```
+
+It is clear that these predictor variables are all highly correlated. Therefore, we should choose one to use in our regression model. Because CO2spl has the highest correlation with global average, we will use CO2spl as the predictive variable in our regression model.
+
+A note on the collinearity: it makes sense that these variables have high correlation. CH4, CO2, and N2O are all pollutants produced simultaneously from machinery such as internal combustion engines and other fossil-fuel burning processes. Humans have burned more fossil fuels as our numbers have increased, so it also makes sense that human population is highly correlated with the concentration of these pollutants. However, the level of correlation surprised me.
+
+Investigating remaining variables:
+```{r}
+cor(df[,c(5, 3, 6, 8, 10)])
+```
+
+
+None of the remaining variables has a correlation above 0.6 with global temperature average. The next highest, CO2_GrRt is close at 0.58, but has a fairly strong correlation with CO2_spl, and therefore doesn't seem like a good candidate for another variable. N2O and CH4 GrRts have a lower correlation with CO2spl, but a fairly weak correlation with global average. Scatterplots affirm this weak correlation, so we will consider these variables when initially developing our model.
+
+Taking a step back: we're trying to create a linear model that relates the concentration of gases to the global temperature. The Growth Rate of the gases represents the derivative of the gas concentration with respect to time. Therefore, if the gas concentration correlates well with the global temperature average, then we wouldn't expect the derivative (growth rate) to correlate as well. 
+
+Plotting growth rate against temperature
+```{r}
+plot(df$CH4_GrRt, df$global.avg2)
+plot(df$N2O_GrRt, df$global.avg2)
+```
+
+Exporting cleaned data to .csv file
+```{r}
+write.table(df, 
+            sep = ",",
+            file = "globalTemp_predictors.csv",
+            col.names = FALSE,
+            row.names = FALSE)
+```
+
+
+
+---------------------------------------- LOCATION EFFECT ----------------------------------
+Now, we'll investigate the effect of a city's location on it's temperature. To make this model compatible with the "Stage 1" model created above, for our dependent variable we will use mean temperature difference from global average. In Stage 1 we will predict the average global temperature at a future date based on pollutant concentrations, then in Stage 2 we will predict the local temperature for a city relative to the global average, based on its location.
+
+Determining the difference between a city's average annual temperature and the global average annual temperature.
+```{r}
+getDiff <- function(v) {
+    # Function to find the mean average between city and global average temperatures
+    # Args: v is vector representing city's annual average temperatures
+    # Returns: mean difference in temperature between given city and global avg
+    return(mean(unlist(v - test2["global.avg2"])))
+}
+x <- test2[,2:(ncol(test2)-1)] # columns containing cities' annual temperatures
+tempDiffs <- apply(x, 2, getDiff) # applying the function to each city (column)
+```
+
+Functions to get the latitude and longitude of a city
+```{r}
+getLat <- function(city) {
+    i <- match(city, temps.by.city$City)
+    return(temps.by.city[i, "Latitude"])
+}
+getLong <- function(city) {
+    # Get the latitude of a given city
+    i <- match(city, temps.by.city$City)
+    return(temps.by.city[i, "Longitude"])
+}
+```
+
+Getting latitude and longitude of cities
+```{r}
+city.list <- colnames(test2) # List of city names whose data we'll investigate
+city.list <- city.list[2:(length(city.list) - 1)] # First column is year; last column is global avg
+city.list <- gsub("\\.", " ", city.list) # replacing periods with spaces in city names
+
+lat <- sapply(city.list, getLat) # Get latitude of each city
+long <- sapply(city.list, getLong) # Get longitude of each city
+```
+
+Data-wrangling latitudes and longitudes. Latitude is represented as number between 0 and 90, followed by either "N" or "S". Longitude ranges from 0 to 180, followed by "W" or "E". I will represent latitude as a number between -90 (representing 90ºS) and 90 (90ºN), and longitude as a number between -180 (180ºW) and 180 (180ºE). Note that 180ºW = 180ºE. 
+```{r}
+lat <- as.character(lat) # turning latitude to character vector
+neg.lat <- which(grepl("S", lat)) # which latitudes are in the southern hemisphere?
+
+EqDist <- substr(lat, start = 1, stop = nchar(lat)-1) # Get numeric value from latitude
+EqDist <- as.numeric(EqDist) # converting string to numeric value
+
+# Representing southern hemisphere latitudes with negative number
+EqDist[neg.lat] <- EqDist[neg.lat] * -1 
+
+long <- as.character(long) # turning longitude into character vector
+neg.long <- which(grepl("W", long)) # which longitudes are in the "West"?
+
+PmDist <- substr(long, start = 1, stop = nchar(long)-1) # Get numeric value from longitude
+PmDist <- as.numeric(PmDist) # converting string to numeric value
+
+# Representing Western hemisphere longitudes with negative number
+PmDist[neg.long] <- PmDist[neg.long] * -1
+```
+
+Creating data frame to hold geographic location and temperature variance data
+```{r}
+geoData <- data.frame(tempDiffs, EqDist, PmDist) 
+```
+
+Investigating variable relationships and correlations
+```{r}
+plot(PmDist, EqDist, xlab = "Longitude", ylab = "Latitude", main = "Map") # Observing geographic distribution
+plot(EqDist, tempDiffs, 
+     xlab = "Latitude", 
+     ylab = "Temperature Difference from Global Avg.",
+     main = "Temperature v. Latitude")
+# Effect of latitude on temperature difference
+
+plot(PmDist, tempDiffs, 
+     xlab = "Longitude", 
+     ylab = "Temperature Difference from Global Avg.",
+     main = "Temperature v. Longitude") # Effect of longitude on temperature difference
+cor(geoData) # correlation matrix
+```
+
+Based on plotting, there are two outliers that should be removed (the only two cases from the southern hemisphere). If we had more data points available for the southern hemisphere, we would create two distinct models based on clustering: one linear model for the southern hemisphere and one for the northern hemisphere. Alternatively, we could take the absolute value of the latitude, instead using "distance from the equator" as our predictive variable. It is important to note that our model only takes into account cities from the Northern Hemisphere, and may not translate to southern hemisphere cities.
+
+There is a strong negative correlation between Latitude and Temperature Difference, and a weak positive correlation between Longitude and Temperature Difference. It makes sense that temperature decreases as distance from the equator increases. It is less obvious how longitude would have an effect on temperature, but cluster analysis could reveal certain regions that have higher or lower than expected temperatures.
+
+Removing outliers
+```{r}
+geoData <- geoData[which(geoData$EqDist > 0),] # removing outliers (southern hemisphere cities)
+```
+
+Exporting cleaned data to .csv file
+```{r}
+write.table(geoData, 
+            sep = ",",
+            file = "geoData.csv",
+            col.names = FALSE,
+            row.names = FALSE)
+```
+
+
+------------------------ TEMPERATURE FORECASTING ----------------------------------
+Creating forecast for temperature based on prior temperature, using linear Regression trend-line.
+
+First, checking for normality and correlation
+```{r}
+delhi.data <- temps[c("Year", "Delhi")]
+hist(delhi.data$Delhi) # histogram
+plot(delhi.data$Year, delhi.data$Delhi) # Plotting average annual temp over time
+
+NAs <- which(is.na(delhi.data$Delhi)) # Determining location of missing values
+a <- delhi.data$Year[-NAs] # "Year" column, excluding any missing values
+b <- delhi.data$Delhi[-NAs] # "Temperature" column, excluding any missing values
+cor(a,b, method = 'pearson') # determining correlation
+```
+The temperatures appear to be normally distributed and correlated to year, meaning linear regression trend fitting will be suitable method for creating a model.
+
+Identifying outliers
+```{r}
+length(which(zScore(delhi.data$Delhi) > 3)) # Count the elements more than 3 standard deviations from the mean
+```
+There are no temperatures more than three standard deviations from the mean, so we will not eliminate any cases as outliers.
+
+Removing missing values, and creating data.frame to hold Delhi's data.
+```{r}
+# First, determining proportion of missing values
+length(which(is.na(delhi.data$Delhi)))/nrow(delhi.data)
+nrow(delhi.data)
+delhi.data <- delhi.data[-which(is.na(delhi.data$Delhi)),] # removing NA values
+```
+I choose to remove all NA values, which account for about 28% of the data set. I make this choice because the initial sample size was fairly large (255), and each of the samples consisted of a twelve month average. Furthermore, when creating a linear regression model, I anticipate putting more weight on recent temperatures (because of human activity in the last 100-150 years which has potentially accelerated the growth rate of temperature). Most of the missing values come from earlier years (~1750 - 1850), so would not have played as significant a role as the more recent temperatures will.
+
+
+Exporting cleaned data to .csv file
+```{r}
+write.table(delhi.data, 
+            sep = ",",
+            file = "delhiTemps.csv",
+            col.names = FALSE,
+            row.names = FALSE)
+```
+
+

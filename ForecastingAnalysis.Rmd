@@ -1,0 +1,233 @@
+Theo Carr
+DS4100 Project
+Forecasting models
+
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Packages
+```{r}
+library(XML)
+library(ggplot2)
+library(magrittr)
+library(yaml)
+library(lubridate)
+library(RCurl)
+library(readxl)
+library(BSDA)
+library(forecast)
+library(caret)
+library(RSQLite)
+library(psych)
+library(RSQLite)
+```
+
+Connecting to database
+```{r}
+db <- dbConnect(SQLite(), "/Users/theocarr/ClimateChange.db") # Connecting to SQLite
+summary(db) # checking the connection
+```
+
+Querying data: Delhi Temperatures
+```{r}
+query <- "SELECT * FROM DelhiTemps;"
+data <- dbSendQuery(db, query) # sending the query
+delhi.data <- dbFetch(data) # fetching the output
+```
+
+Disconnecting from data base
+```{r}
+dbDisconnect(db)
+```
+
+
+Separating Training/Validation data
+```{r}
+sample.indices <- sample(nrow(delhi.data), 0.7 * nrow(delhi.data)) # random indices to sample
+
+training.data <- delhi.data[sample.indices,] # assigning training data
+training.data <- training.data[order(training.data$Year),] # ordering the training data
+
+validation.data <- delhi.data[-sample.indices,] # assigning validation data
+validation.data <- validation.data[order(validation.data$Year),] # ordering the validation data
+```
+
+Next, model creation and evaluation
+First, functions for calculating the MSE:
+```{r}
+# A function to help with calculating the MSE
+diffSqr <- function(i, actuals, preds) {
+    # This function calculates the difference between actual and forecasted value at a particular index,
+    # then squares the result
+    # Args: - i is index of value to calculate
+    #       - actuals represents vector of actual values
+    #       - preds represents vector of predicted values
+    # Returns: numeric, representing the squared difference between the actual and predicted value
+    return((actuals[i] - preds[i])^2) # take difference and square result
+}
+
+MSE <- function(actuals, preds) {
+    # Calculate the MSE of a model based on vector of actual and predicted values
+    # Args: - actuals represents vector of actual values
+    #       - preds represents vector of predicted values
+    return(sum(sapply(1:length(actuals), 
+                      diffSqr, 
+                      actuals = actuals, 
+                      preds = preds)) / length(actuals))
+}
+```
+
+Creating a linear regression model
+```{r}
+model <- lm(data = training.data, Delhi ~ Year) # creating a linear regression model
+plot(training.data$Year, training.data$Delhi) # creating scatterplot
+abline(model) # displaying the model's trendline
+summary(model)
+```
+
+Computing the MSE for linear regression model:
+```{r}
+Year <- validation.data$Year # Getting years from validation data set, to use for predicting
+Year <- data.frame(Year) # Wrapping years inside data frame
+preds <- predict(model, Year) # Generating temperature predictions for given years
+actuals <- validation.data$Delhi # Actual temperatures for given years
+mse_lm <- MSE(actuals, preds); mse_lm # calculating MSE and outputting result
+```
+
+Creating an exponential smoothing model
+```{r}
+actuals <- delhi.data$Delhi # actual temperature values
+
+exp_smooth <- function(actuals, alpha) {
+    # Function generates predictions using exponential smoothing
+    # Args: - actuals represents actual (observed) values
+    #       - alpha represents exponential smoothing constant
+    preds <- numeric(length(actuals)) # creating empty vector to contain predictions
+    preds[1] <- actuals[1] # seed model by setting first prediction equal to actual
+    for (i in 2:length(actuals)) { # for remaining empty elements in the vector
+        preds[i] <- preds[i-1] + alpha * (actuals[i-1] - preds[i-1]) # exponential smoothing eqn
+    }
+    return(preds)
+}
+```
+
+Tuning the model, by selecting ideal value for exponential smoothing constant.
+```{r}
+actuals <- delhi.data$Delhi # actual temperature values
+alpha.vals <- seq(from = 0.001, to = 1, by = 0.001) # values for exp. smoothing const. to check
+# Next, we'll try out different values for the smoothing constant
+test.results <- sapply(alpha.vals, exp_smooth, actuals = actuals) 
+mse.vals <- apply(test.results, 2, MSE, actuals = actuals) # Calculating the MSE for each value of constant
+best <- which.min(mse.vals); # determining index of minimum MSE
+a.exp <- alpha.vals[best]; a.exp # the choice for smoothing constant
+MSE(actuals, exp_smooth(actuals, a.exp)) # MSE using exponential smoothing with ideal constant
+```
+Linear regression and exponential smoothing are not easily comparable. For the linear regression model, we used a training data set to create the model, then computed MSE by testing the model against the validation data set. For exponential smoothing, the model does not take into account all past observations (as linear regression does). Instead, the model uses the previous prediction and the error of the previous prediction. There is no division of training data and validation data, and the model is only useful for looking at the next time-step (because each new prediction requires a prior prediction and an actual observed value).
+
+Weighted moving average
+```{r}
+# Yt = a*Y(t-1) + b*Y(t-2) + c*Y(t-3) # Equation for weighted moving average, where Yt represents
+# the Temperature at time period t.
+
+wma.new.pred <- function(i, vector, a, b, c) {
+    # Function generates prediction for next time period based on weighted moving average
+    # Args: - "i" represents index
+    #       - "vector" represents actual observed values
+    #       - "a", "b", "c" represent weights for averaging
+    # Returns: - value corresponding to weighted average of previous three time periods 
+    if(i == 1) { # we'll set first average equal to actual
+        return(vector[1])
+    }
+    else if(i == 2) { # second average is first actual value
+        return(vector[1])
+    }
+    else if(i == 3) { # third prediction is average of first two actual values
+        return((a * vector[2] + b * vector[1]) / (a+b))
+    }
+    else { # otherwise, we'll average previous three values to get prediction
+    return((a * vector[i-1] + b * vector[i-2] + c * vector[i-3]) / (a + b + c))
+    }
+}
+
+wma <- function(vector, a, b, c) {
+    # Function generates weighted moving average for a vector, based on three previous values.
+    # Args: - "vector" represents actual observed values
+    #       - "a", "b", "c" represent weights for averaging
+    # Returns: vector of weighted averages
+    n <- length(vector) # length of vector
+    preds <- numeric(length = n) # create new empty numeric vector of same length, to hold averages
+    indices <- 1:n # representing all indices of the vector
+    preds <- sapply(indices, wma.new.pred, vector = vector, a = a, b = b, c = c)
+    return(preds)
+}
+```
+
+Tuning the weighted moving average (i.e. finding the ideal weights for the model).
+```{r}
+actuals <- delhi.data$Delhi # actual temperature values
+
+dim <- 20 # max value for weights 
+
+MSE_tracker <- array(dim = c(dim, dim, dim)) # creating an array to hold all MSE values
+# three dimensional because we want to find ideal a, b, and c
+
+for (a in 1:dim) { # for each value of a
+    for (b in 1:dim) { # for each value of b
+        for (c in 1:dim) { # for each value of c
+        preds <- wma(delhi.data$Delhi, a, b, c) # Getting weighted moving average
+        MSE_tracker[a, b, c] <- MSE(delhi.data$Delhi, preds) # calculate MSE and add to array
+        }
+    }
+}
+best.index <- which.min(MSE_tracker); best.index # determining index of the minimum MSE
+MSE_tracker[which.min(MSE_tracker)] # outputting the minimum MSE
+
+# After determining single index for best a,b,c, we need to figure out the values
+# for a, b, c corresponding to this index
+c.best <- ceiling(best.index / dim^2) # determine "height" of index
+b.best <- ceiling((best.index - ((c.best-1) * dim^2)) / dim) # determine "column" of index
+a.best <- best.index - (((c.best-1) * dim^2) + ((b.best-1) * dim)) # determine "row" of index
+```
+
+Despite this difficulty in comparison, we note that the MSE is lower for exponential smoothing than for linear regression. The plots below illustrate the difference between actual values, and the predictions of both models:
+```{r}
+# Exponential smoothing predictions
+ExpSmooth.preds <- exp_smooth(actuals, a.exp)
+
+# Linear regression predictions
+Year <- delhi.data$Year # Getting years from validation data set, to use for predicting
+df <- data.frame(Year) # Wrapping years inside data frame
+LinReg.preds <- predict(model, df) # Generating temperature predictions for given years
+
+# Weighted moving average predictions
+WMA.preds <- wma(delhi.data$Delhi, a.best, b.best, c.best) # weighted movin
+
+# Wrapping actuals and predictions in data frame
+model.data <- data.frame(Year, actuals, ExpSmooth.preds, LinReg.preds) #, WMA.preds) 
+
+# Now, plotting models against the actual
+ggplot(model.data, aes(Year)) + 
+    geom_line(aes(y = actuals, color = "Actual Temperature")) +
+    geom_line(aes(y = ExpSmooth.preds, color = "Exponential Smoothing Prediction")) +
+    labs(x = "Year", y = "Average Temperature (ºC)", title = "Temperature in Delhi")
+ggplot(model.data, aes(Year)) + 
+    geom_line(aes(y = actuals, color = "Actual Temperature")) +
+    geom_line(aes(y = LinReg.preds, color = "Linear Regression Prediction")) +
+    labs(x = "Year", y = "Average Temperature (ºC)", title = "Temperature in Delhi")
+ggplot(model.data, aes(Year)) + 
+    geom_line(aes(y = actuals, color = "Actual Temperature")) +
+    geom_line(aes(y = WMA.preds, color = "Weighted Moving Average Prediction")) +
+    labs(x = "Year", y = "Average Temperature (ºC)", title = "Temperature in Delhi")
+ggplot(model.data, aes(Year)) + 
+    geom_line(aes(y = ExpSmooth.preds, color = "Exponential Smoothing Prediction")) +
+    geom_line(aes(y = LinReg.preds, color = "Linear Regression Prediction")) +
+    geom_line(aes(y = WMA.preds, color = "Weighted Moving Average Prediction")) +
+    labs(x = "Year", y = "Average Temperature (ºC)", title = "Temperature in Delhi")
+```
+Results from graphing: there is lots of variation from year to year. A three year moving average reduces some of this volatility, but a better approach might be to take a ten or twenty-year moving average. This would reduce some of the volatility and allow us to focus on larger trend.
+
+Linear regression reveals a clear positive trend. 
+
+Exponential smoothing results in a smoother graph than weighted moving average, but tracks the actual values more closely than linear regression.
