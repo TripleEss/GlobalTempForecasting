@@ -1,5 +1,5 @@
 # GlobalTempForecasting
-The purpose of this project was to predict future temperatures for different cities based on geographic location and concentrations of atmospheric pollutants.
+The purpose of this project was to predict future temperatures for different cities based on geographic location and concentrations of atmospheric pollutants. For a presentation of the results, see https://recordings.join.me/V_Z3z8oIzUmeaI9omBce8g.
 
 For a visual schema of the project, see README.docx.
 
